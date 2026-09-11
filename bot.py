@@ -18,13 +18,12 @@ TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", str(ADMIN_ID)))
 API_URL_DEFAULT = "https://draw.ar-lottery01.com/WinGo/WinGo_1M/GetHistoryIssuePage.json"
 POLL_SECONDS = max(1, int(os.getenv("POLL_SECONDS", "2")))
 NEXT_SEND_DELAY = max(1, int(os.getenv("NEXT_SEND_DELAY", "90")))
-REQUEST_TIMEOUT = max(5, int(os.getenv("REQUEST_TIMEOUT", "15")))
+REQUEST_TIMEOUT = 5
 # Only used when the origin returns HTTP 403/blocked to Render.
 # The origin URL itself remains the primary source.
 API_PROXY_URLS = [
-    "https://r.jina.ai/",
+    "https://api.codetabs.com/v1/proxy?quest=",
     "https://api.allorigins.win/raw?url=",
-    "https://corsproxy.io/?url=",
 ]
 PORT = int(os.getenv("PORT", "10000"))
 DATA_FILE = Path("data.json")
@@ -411,7 +410,7 @@ async def fetch_latest(session):
             async with session.get(
                 proxy_url,
                 headers=proxy_headers,
-                timeout=aiohttp.ClientTimeout(total=max(REQUEST_TIMEOUT, 20)),
+                timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
                 allow_redirects=True,
             ) as resp:
                 raw = await resp.read()
