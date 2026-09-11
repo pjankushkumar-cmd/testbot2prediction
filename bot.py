@@ -5,6 +5,7 @@ import logging
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import aiohttp
 from aiohttp import web
@@ -18,6 +19,10 @@ API_URL_DEFAULT = "https://draw.ar-lottery01.com/WinGo/WinGo_1M/GetHistoryIssueP
 POLL_SECONDS = max(1, int(os.getenv("POLL_SECONDS", "2")))
 NEXT_SEND_DELAY = max(1, int(os.getenv("NEXT_SEND_DELAY", "90")))
 REQUEST_TIMEOUT = max(5, int(os.getenv("REQUEST_TIMEOUT", "15")))
+API_PROXY_URLS = [
+    "https://api.allorigins.win/raw?url=",
+    "https://corsproxy.io/?url=",
+]
 PORT = int(os.getenv("PORT", "10000"))
 DATA_FILE = Path("data.json")
 
@@ -342,6 +347,7 @@ async def fetch_latest(session):
         log.warning("AIOHTTP API attempt failed: %s", first_error)
 
     # Fallback: urllib. This handles unusual proxy/content-type behavior independently.
+    second_error = None
     try:
         status, hdrs, raw = await _fetch_with_urllib(url)
         runtime["api_http"] = status
@@ -355,11 +361,47 @@ async def fetch_latest(session):
             log.info("API FALLBACK LATEST -> period=%s result=%s", period, result)
             return period, result
         raise ValueError("Fallback JSON received but data.list[0].issueNumber/number not found")
-    except Exception as second_error:
-        runtime["api_ok"] = False
-        runtime["api_error"] = f"AIOHTTP: {type(first_error).__name__}: {first_error} | FALLBACK: {type(second_error).__name__}: {second_error}"
-        log.error("API ERROR -> %s", runtime["api_error"])
-        return None, None
+    except Exception as e:
+        second_error = e
+        log.warning("DIRECT API still failed: %s", e)
+
+    # Render/cloud IPs can receive HTTP 403 even though the endpoint is public.
+    # If that happens, fetch the SAME endpoint through a simple raw-response proxy.
+    # No local API file/folder is required.
+    encoded = quote(base, safe="")
+    for proxy_base in API_PROXY_URLS:
+        proxy_url = proxy_base + encoded
+        try:
+            log.info("API PROXY GET: %s", proxy_url.split("?url=")[0] + "?url=<encoded>")
+            async with session.get(
+                proxy_url,
+                headers={"User-Agent": headers["User-Agent"], "Accept": "application/json, text/plain, */*"},
+                timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+                allow_redirects=True,
+            ) as resp:
+                raw = await resp.read()
+                log.info("API PROXY HTTP %s | content-type=%s | bytes=%d", resp.status, resp.headers.get("Content-Type", ""), len(raw))
+                if resp.status >= 400:
+                    raise RuntimeError(f"PROXY HTTP {resp.status}")
+                payload = await _decode_api_bytes(raw)
+                period, result = parse_latest(payload)
+                if period and result is not None:
+                    runtime.update({"api_ok": True, "api_error": "", "last_period": period, "last_result": result})
+                    runtime["api_http"] = 200
+                    log.info("API PROXY LATEST -> period=%s result=%s", period, result)
+                    return period, result
+                raise ValueError("Proxy returned JSON but data.list[0].issueNumber/number not found")
+        except Exception as proxy_error:
+            log.warning("API proxy failed: %s", proxy_error)
+
+    runtime["api_ok"] = False
+    runtime["api_error"] = (
+        f"Direct: {type(first_error).__name__}: {first_error} | "
+        f"Fallback: {type(second_error).__name__}: {second_error} | "
+        "Proxy attempts failed"
+    )
+    log.error("API ERROR -> %s", runtime["api_error"])
+    return None, None
 
 
 # ---------- Telegram output ----------
