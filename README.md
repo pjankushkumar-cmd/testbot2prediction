@@ -1,4 +1,4 @@
-# Bot 1 — Web Service FINAL4
+# Bot 1 — Web Service FINAL3
 
 Render Web Service only.
 
@@ -15,16 +15,8 @@ Environment variables:
 - API_URL=https://draw.ar-lottery01.com/WinGo/WinGo_1M/GetHistoryIssuePage.json
 - POLL_SECONDS=2
 - NEXT_SEND_DELAY=90
-- REQUEST_TIMEOUT=15
+- REQUEST_TIMEOUT=12
 
-## 403 fix
+Do not set PORT manually. Render provides PORT.
 
-The bot now tries, in order:
-1. Normal aiohttp request with browser/origin headers.
-2. Chrome-impersonated request using `curl_cffi`.
-3. urllib fallback.
-4. Server-side raw-response proxy fallbacks.
-
-The proxy target includes a cache-buster so an old cached result is not reused. JSON parsing also handles JSON wrapped by a reader/proxy.
-
-`/status` reports the real HTTP status and the latest period/result. If every route is blocked, the bot reports the exact failure instead of showing fake data.
+The bot first requests the configured API directly. If Render receives HTTP 403 from the origin, it automatically tries a server-side reader fallback, then other raw-response proxies. It parses the same JSON and looks for data.list[0].issueNumber and data.list[0].number (with defensive fallbacks). No local API file or folder is required.
