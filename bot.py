@@ -901,8 +901,13 @@ async def post_init(application: Application):
     health_runner = await start_health_server()
     log.info("Render health server started on port %s", PORT)
 
-    worker_task = asyncio.create_task(cycle_worker(application))
-    log.info("Cycle worker task created.")
+    # Use PTB's managed task system so the worker definitely runs on the
+    # same event loop as Telegram polling and is tracked by the Application.
+    worker_task = application.create_task(
+        cycle_worker(application),
+        name="bot1-cycle-worker",
+    )
+    log.info("Cycle worker task created and scheduled by Application.")
 
 
 async def post_shutdown(application: Application):
