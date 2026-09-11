@@ -171,6 +171,7 @@ runtime = {
 }
 
 worker_task = None
+health_runner = None
 capture_tasks = {}
 
 
@@ -345,8 +346,12 @@ async def fetch_latest(session):
     log.info("API request: %s", url)
 
     try:
+        # Cache-buster is useful on Render/proxies so the newest settled
+        # period is requested every poll.
+        request_url = url + ("&" if "?" in url else "?") + "_t=" + str(int(time.time() * 1000))
+
         async with session.get(
-            url,
+            request_url,
             headers=headers,
             timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
             allow_redirects=True,
@@ -889,19 +894,34 @@ async def start_health_server():
 # APP STARTUP
 # =========================
 async def post_init(application: Application):
-    global worker_task
+    global worker_task, health_runner
+
+    # IMPORTANT: health server + Telegram + cycle worker all run on the
+    # SAME asyncio event loop used by python-telegram-bot.
+    health_runner = await start_health_server()
+    log.info("Render health server started on port %s", PORT)
+
     worker_task = asyncio.create_task(cycle_worker(application))
     log.info("Cycle worker task created.")
 
 
 async def post_shutdown(application: Application):
-    global worker_task
+    global worker_task, health_runner
+
     if worker_task:
         worker_task.cancel()
         try:
             await worker_task
         except asyncio.CancelledError:
             pass
+        worker_task = None
+
+    if health_runner:
+        try:
+            await health_runner.cleanup()
+        except Exception:
+            log.exception("Health server cleanup failed")
+        health_runner = None
 
 
 def build_application():
@@ -938,20 +958,13 @@ def build_application():
 
 
 def main():
-    health_runner = asyncio.run(start_health_server())
-
-    try:
-        app = build_application()
-        log.info("Starting Telegram polling...")
-        app.run_polling(
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=False,
-        )
-    finally:
-        try:
-            asyncio.run(health_runner.cleanup())
-        except Exception:
-            pass
+    app = build_application()
+    log.info("Starting Telegram polling + API worker...")
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=False,
+        close_loop=True,
+    )
 
 
 if __name__ == "__main__":
