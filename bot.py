@@ -298,16 +298,39 @@ async def _decode_api_bytes(raw: bytes):
         except json.JSONDecodeError:
             pass
 
+    # Reader/proxy services may prepend a short markdown/HTML notice before the
+    # actual JSON. Extract the outermost JSON object/array as a final fallback.
+    for start_char, end_char in (("{", "}"), ("[", "]")):
+        start = text.find(start_char)
+        end = text.rfind(end_char)
+        if start >= 0 and end > start:
+            fragment = text[start:end + 1].strip()
+            try:
+                return json.loads(fragment)
+            except json.JSONDecodeError:
+                continue
+
     raise ValueError(f"Invalid JSON body: {text[:500]}")
 
 
 def _requests_headers():
+    # Browser-like headers matter here: the draw host can return 403 to generic
+    # server clients even though the same endpoint works from a normal browser.
     return {
-        "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36",
+        "User-Agent": (
+            "Mozilla/5.0 (Linux; Android 13; Pixel 7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Mobile Safari/537.36"
+        ),
         "Accept": "application/json, text/plain, */*",
-        "Referer": "https://draw.ar-lottery01.com/",
+        "Accept-Language": "en-IN,en;q=0.9,en-US;q=0.8",
+        "Referer": "https://ar-game.com/web/home",
+        "Origin": "https://ar-game.com",
         "Cache-Control": "no-cache",
         "Pragma": "no-cache",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "cross-site",
     }
 
 
@@ -319,6 +342,27 @@ async def _fetch_with_urllib(url):
         req = Request(url, headers=_requests_headers(), method="GET")
         with urlopen(req, timeout=REQUEST_TIMEOUT) as r:
             return int(getattr(r, "status", 200)), dict(r.headers.items()), r.read()
+
+    return await asyncio.to_thread(do_request)
+
+
+async def _fetch_with_curl_cffi(url):
+    """Chrome-impersonating HTTP fallback for servers that reject generic clients."""
+    try:
+        from curl_cffi import requests as curl_requests
+    except Exception as e:
+        raise RuntimeError(f"curl_cffi unavailable: {e}")
+
+    def do_request():
+        # curl_cffi is synchronous, so keep it off the asyncio event loop.
+        r = curl_requests.get(
+            url,
+            headers=_requests_headers(),
+            impersonate="chrome120",
+            timeout=REQUEST_TIMEOUT,
+            allow_redirects=True,
+        )
+        return int(r.status_code), dict(r.headers), r.content
 
     return await asyncio.to_thread(do_request)
 
@@ -357,6 +401,32 @@ async def fetch_latest(session):
     except Exception as first_error:
         log.warning("AIOHTTP API attempt failed: %s", first_error)
 
+    # Second direct fallback: impersonate a real Chrome client. This is useful when
+    # the origin/WAF rejects aiohttp's TLS/client fingerprint with HTTP 403.
+    curl_error = None
+    try:
+        status, hdrs, raw = await _fetch_with_curl_cffi(url)
+        runtime["api_http"] = status
+        log.info(
+            "CURL-CFFI HTTP %s | content-type=%s | bytes=%d",
+            status, hdrs.get("content-type", ""), len(raw)
+        )
+        if status >= 400:
+            raise RuntimeError(f"HTTP {status}")
+        payload = await _decode_api_bytes(raw)
+        period, result = parse_latest(payload)
+        if period and result is not None:
+            runtime.update({
+                "api_ok": True, "api_error": "",
+                "last_period": period, "last_result": result
+            })
+            log.info("CURL-CFFI LATEST -> period=%s result=%s", period, result)
+            return period, result
+        raise ValueError("Chrome response received but issueNumber/number was not found")
+    except Exception as e:
+        curl_error = e
+        log.warning("Chrome-impersonated API attempt failed: %s", e)
+
     # Fallback: urllib. This handles unusual proxy/content-type behavior independently.
     second_error = None
     try:
@@ -385,9 +455,9 @@ async def fetch_latest(session):
     proxy_jobs = []
     for proxy_base in API_PROXY_URLS:
         if proxy_base == "https://r.jina.ai/":
-            proxy_jobs.append((proxy_base + base, True))
+            proxy_jobs.append((proxy_base + url, True))
         else:
-            proxy_jobs.append((proxy_base + quote(base, safe=""), False))
+            proxy_jobs.append((proxy_base + quote(url, safe=""), False))
 
     for proxy_url, is_jina in proxy_jobs:
         try:
@@ -428,8 +498,9 @@ async def fetch_latest(session):
 
     runtime["api_ok"] = False
     runtime["api_error"] = (
-        f"Direct: {type(first_error).__name__}: {first_error} | "
-        f"Fallback: {type(second_error).__name__}: {second_error} | "
+        f"AIOHTTP: {type(first_error).__name__}: {first_error} | "
+        f"Chrome: {type(curl_error).__name__}: {curl_error} | "
+        f"Urllib: {type(second_error).__name__}: {second_error} | "
         "Proxy attempts failed"
     )
     log.error("API ERROR -> %s", runtime["api_error"])
