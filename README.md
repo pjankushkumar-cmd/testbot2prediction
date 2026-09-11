@@ -1,34 +1,33 @@
-# Bot 1
+# Bot 1 — Render Web Service
 
-## Render
-Service: Background Worker
+Use Render **Web Service** (not Background Worker).
 
-Build:
+Build Command:
 `pip install -r requirements.txt`
 
-Start:
+Start Command:
 `python bot.py`
 
-Environment:
-- `BOT_TOKEN` = Telegram bot token
-- `ADMIN_ID` = `8767998937`
-- `API_URL` = `https://draw.ar-lottery01.com/WinGo/WinGo_1M/GetHistoryIssuePage.json`
-- `POLL_SECONDS` = `2`
-- `TARGET_CHAT_ID` = `8767998937`
+Environment variables:
+`BOT_TOKEN` = your BotFather token
+`ADMIN_ID` = 8767998937
+`TARGET_CHAT_ID` = 8767998937
+`API_URL` = https://draw.ar-lottery01.com/WinGo/WinGo_1M/GetHistoryIssuePage.json
+`POLL_SECONDS` = 2
+`NEXT_SEND_DELAY` = 90
+`REQUEST_TIMEOUT` = 12
 
-## Commands
+Do not set PORT manually; Render supplies PORT automatically.
+
+Commands:
 `/start`
 `/go`
 `/stop`
 `/status`
+`/setmessage 0` then send the message
+`/setheader` then send the header; use `{period3}`
+`/updateapi <URL>`
 `/changename <name>`
 `/clearchat`
-`/setmessage <0-9> <message>`
-`/setheader <text>`
-`/updateapi <URL>`
 
-For the period header, use `{period3}` where the last 3 digits of the API period should appear.
-
-Only `ADMIN_ID` can use admin commands.
-
-Telegram bots cannot delete arbitrary old chat history. `/clearchat` deletes messages that this bot has recorded as sent.
+The service exposes `/health` for Render's web-service port check.
