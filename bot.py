@@ -385,6 +385,8 @@ async def fetch_latest(session):
     # Render/cloud IPs can receive HTTP 403 even though the endpoint is publicly
     # reachable from normal clients. Try a server-side reader as a fallback.
     # Jina Reader accepts an absolute target URL directly after r.jina.ai/.
+    # Public read-only fallbacks, in the same order as the supplied
+    # working WinGo HTML: CORS proxy -> Jina -> AllOrigins.
     proxy_jobs = []
     for proxy_base in API_PROXY_URLS:
         if proxy_base == "https://r.jina.ai/":
@@ -398,13 +400,13 @@ async def fetch_latest(session):
                 proxy_headers = {
                     "User-Agent": headers["User-Agent"],
                     "Accept": "application/json, text/plain, */*",
-                    "X-Engine": "direct",
-                    "X-No-Cache": "true",
-                    "X-Respond-With": "text",
                 }
                 safe_log_url = "https://r.jina.ai/<target-url>"
             else:
-                proxy_headers = {"User-Agent": headers["User-Agent"], "Accept": "application/json, text/plain, */*"}
+                proxy_headers = {
+                    "User-Agent": headers["User-Agent"],
+                    "Accept": "application/json, text/plain, */*",
+                }
                 safe_log_url = proxy_url.split("?url=")[0] + "?url=<encoded>"
 
             log.info("API PROXY GET: %s", safe_log_url)
@@ -415,17 +417,31 @@ async def fetch_latest(session):
                 allow_redirects=True,
             ) as resp:
                 raw = await resp.read()
-                log.info("API PROXY HTTP %s | content-type=%s | bytes=%d", resp.status, resp.headers.get("Content-Type", ""), len(raw))
+                log.info(
+                    "API PROXY HTTP %s | content-type=%s | bytes=%d",
+                    resp.status,
+                    resp.headers.get("Content-Type", ""),
+                    len(raw),
+                )
                 if resp.status >= 400:
                     raise RuntimeError(f"PROXY HTTP {resp.status}")
+
                 payload = await _decode_api_bytes(raw)
                 period, result = parse_latest(payload)
                 if period and result is not None:
-                    runtime.update({"api_ok": True, "api_error": "", "last_period": period, "last_result": result})
+                    runtime.update({
+                        "api_ok": True,
+                        "api_error": "",
+                        "last_period": period,
+                        "last_result": result,
+                    })
                     runtime["api_http"] = 200
                     log.info("API PROXY LATEST -> period=%s result=%s", period, result)
                     return period, result
-                raise ValueError("Proxy returned data but issueNumber/number was not found")
+
+                raise ValueError(
+                    "Proxy JSON received but latest issueNumber/number was not found"
+                )
         except Exception as proxy_error:
             log.warning("API proxy failed: %s", proxy_error)
 
