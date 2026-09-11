@@ -19,7 +19,10 @@ API_URL_DEFAULT = "https://draw.ar-lottery01.com/WinGo/WinGo_1M/GetHistoryIssueP
 POLL_SECONDS = max(1, int(os.getenv("POLL_SECONDS", "2")))
 NEXT_SEND_DELAY = max(1, int(os.getenv("NEXT_SEND_DELAY", "90")))
 REQUEST_TIMEOUT = max(5, int(os.getenv("REQUEST_TIMEOUT", "15")))
+# Only used when the origin returns HTTP 403/blocked to Render.
+# The origin URL itself remains the primary source.
 API_PROXY_URLS = [
+    "https://r.jina.ai/",
     "https://api.allorigins.win/raw?url=",
     "https://corsproxy.io/?url=",
 ]
@@ -287,6 +290,14 @@ async def _decode_api_bytes(raw: bytes):
                     return json.loads(candidate[start:end + 1])
                 except json.JSONDecodeError:
                     pass
+    # Reader/proxy responses may wrap JSON in a markdown code fence.
+    fenced = text.replace("```json", "").replace("```", "").strip()
+    if fenced != text:
+        try:
+            return json.loads(fenced)
+        except json.JSONDecodeError:
+            pass
+
     raise ValueError(f"Invalid JSON body: {text[:500]}")
 
 
@@ -368,15 +379,36 @@ async def fetch_latest(session):
     # Render/cloud IPs can receive HTTP 403 even though the endpoint is public.
     # If that happens, fetch the SAME endpoint through a simple raw-response proxy.
     # No local API file/folder is required.
-    encoded = quote(base, safe="")
+    # Render/cloud IPs can receive HTTP 403 even though the endpoint is publicly
+    # reachable from normal clients. Try a server-side reader as a fallback.
+    # Jina Reader accepts an absolute target URL directly after r.jina.ai/.
+    proxy_jobs = []
     for proxy_base in API_PROXY_URLS:
-        proxy_url = proxy_base + encoded
+        if proxy_base == "https://r.jina.ai/":
+            proxy_jobs.append((proxy_base + base, True))
+        else:
+            proxy_jobs.append((proxy_base + quote(base, safe=""), False))
+
+    for proxy_url, is_jina in proxy_jobs:
         try:
-            log.info("API PROXY GET: %s", proxy_url.split("?url=")[0] + "?url=<encoded>")
+            if is_jina:
+                proxy_headers = {
+                    "User-Agent": headers["User-Agent"],
+                    "Accept": "application/json, text/plain, */*",
+                    "X-Engine": "direct",
+                    "X-No-Cache": "true",
+                    "X-Respond-With": "text",
+                }
+                safe_log_url = "https://r.jina.ai/<target-url>"
+            else:
+                proxy_headers = {"User-Agent": headers["User-Agent"], "Accept": "application/json, text/plain, */*"}
+                safe_log_url = proxy_url.split("?url=")[0] + "?url=<encoded>"
+
+            log.info("API PROXY GET: %s", safe_log_url)
             async with session.get(
                 proxy_url,
-                headers={"User-Agent": headers["User-Agent"], "Accept": "application/json, text/plain, */*"},
-                timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+                headers=proxy_headers,
+                timeout=aiohttp.ClientTimeout(total=max(REQUEST_TIMEOUT, 20)),
                 allow_redirects=True,
             ) as resp:
                 raw = await resp.read()
@@ -390,7 +422,7 @@ async def fetch_latest(session):
                     runtime["api_http"] = 200
                     log.info("API PROXY LATEST -> period=%s result=%s", period, result)
                     return period, result
-                raise ValueError("Proxy returned JSON but data.list[0].issueNumber/number not found")
+                raise ValueError("Proxy returned data but issueNumber/number was not found")
         except Exception as proxy_error:
             log.warning("API proxy failed: %s", proxy_error)
 
@@ -542,6 +574,11 @@ async def go(update, context):
     runtime["cycle_target"] = None
     runtime["phase"] = "idle"
     runtime["confirmed_at"] = None
+    runtime["confirmed_period"] = None
+    runtime["confirmed_result"] = None
+    runtime["api_error"] = ""
+    runtime["api_ok"] = False
+    runtime["api_http"] = None
     await update.effective_message.reply_text("▶️ Bot 1 started.")
 
 async def stop(update, context):
