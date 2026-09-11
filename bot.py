@@ -4,59 +4,36 @@ import asyncio
 import logging
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import aiohttp
 from aiohttp import web
-
 from telegram import Update, MessageEntity
-from telegram.constants import ParseMode
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
-# =========================
-# CONFIG
-# =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "8767998937"))
 TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", str(ADMIN_ID)))
-
-API_URL_DEFAULT = (
-    "https://draw.ar-lottery01.com/WinGo/WinGo_1M/"
-    "GetHistoryIssuePage.json"
-)
-
+API_URL_DEFAULT = "https://draw.ar-lottery01.com/WinGo/WinGo_1M/GetHistoryIssuePage.json"
 POLL_SECONDS = max(1, int(os.getenv("POLL_SECONDS", "2")))
 NEXT_SEND_DELAY = max(1, int(os.getenv("NEXT_SEND_DELAY", "90")))
-REQUEST_TIMEOUT = max(5, int(os.getenv("REQUEST_TIMEOUT", "12")))
+REQUEST_TIMEOUT = max(5, int(os.getenv("REQUEST_TIMEOUT", "15")))
 PORT = int(os.getenv("PORT", "10000"))
-
 DATA_FILE = Path("data.json")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("bot1")
 
-DEFAULT_HEADER = (
-    "🚨 DM WIN GAME 🚨\n"
-    "🔝 WINGO 1 MIN 🔝\n"
-    "PERIOD NO ➡️ {period3}\n"
-    "ONLY ALL WALLET BET 📊"
-)
+DEFAULT_HEADER = "🚨 DM WIN GAME 🚨\n🔝 WINGO 1 MIN 🔝\nPERIOD NO ➡️ {period3}\nONLY ALL WALLET BET 📊"
 
-# =========================
-# DATA
-# =========================
+
+def empty_record():
+    return {"text": "", "entities": []}
+
+
 def default_data():
     return {
-        "messages": {str(i): {"text": "", "entities": []} for i in range(10)},
+        "messages": {str(i): empty_record() for i in range(10)},
         "header": {"text": DEFAULT_HEADER, "entities": []},
         "api_url": API_URL_DEFAULT,
         "running": False,
@@ -71,19 +48,18 @@ def load_data():
             if isinstance(saved, dict):
                 d.update(saved)
     except Exception:
-        log.exception("Could not load data.json")
-
+        log.exception("data.json load failed")
     if not isinstance(d.get("messages"), dict):
         d["messages"] = {}
     for i in range(10):
-        d["messages"].setdefault(str(i), {"text": "", "entities": []})
-
+        old = d["messages"].get(str(i), {})
+        if isinstance(old, str):
+            old = {"text": old, "entities": []}
+        d["messages"][str(i)] = old
     if not isinstance(d.get("header"), dict):
         d["header"] = {"text": DEFAULT_HEADER, "entities": []}
-
     if not d.get("api_url"):
         d["api_url"] = API_URL_DEFAULT
-
     return d
 
 
@@ -92,42 +68,24 @@ DATA = load_data()
 
 def save_data():
     tmp = DATA_FILE.with_suffix(".tmp")
-    tmp.write_text(
-        json.dumps(DATA, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    tmp.write_text(json.dumps(DATA, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(DATA_FILE)
 
 
-# =========================
-# TELEGRAM ENTITY HELPERS
-# =========================
-ENTITY_FIELDS = {
-    "url", "user", "language", "custom_emoji_id", "emoji",
-    "type", "offset", "length"
-}
-
-
+# ---------- Telegram formatting ----------
 def entity_to_dict(e: MessageEntity):
-    out = {
-        "type": e.type,
-        "offset": e.offset,
-        "length": e.length,
-    }
-    for key in ("url", "language", "custom_emoji_id"):
-        value = getattr(e, key, None)
-        if value is not None:
-            out[key] = value
+    out = {"type": e.type, "offset": e.offset, "length": e.length}
+    for k in ("url", "language", "custom_emoji_id"):
+        v = getattr(e, k, None)
+        if v is not None:
+            out[k] = v
     return out
 
 
 def message_to_record(message):
     text = message.text or message.caption or ""
     entities = message.entities or message.caption_entities or []
-    return {
-        "text": text,
-        "entities": [entity_to_dict(e) for e in entities],
-    }
+    return {"text": text, "entities": [entity_to_dict(e) for e in entities]}
 
 
 def record_to_entities(record):
@@ -135,184 +93,144 @@ def record_to_entities(record):
     for x in (record or {}).get("entities", []):
         if not isinstance(x, dict):
             continue
-        kwargs = {
-            "type": x.get("type"),
-            "offset": int(x.get("offset", 0)),
-            "length": int(x.get("length", 0)),
-        }
-        for key in ("url", "language", "custom_emoji_id"):
-            if x.get(key) is not None:
-                kwargs[key] = x[key]
         try:
+            kwargs = {
+                "type": x.get("type"),
+                "offset": int(x.get("offset", 0)),
+                "length": int(x.get("length", 0)),
+            }
+            for k in ("url", "language", "custom_emoji_id"):
+                if x.get(k) is not None:
+                    kwargs[k] = x[k]
             result.append(MessageEntity(**kwargs))
         except Exception:
-            log.exception("Bad Telegram entity: %s", x)
+            log.exception("Invalid entity: %r", x)
     return result
 
 
 def record_text(record):
-    return (record or {}).get("text", "")
+    return str((record or {}).get("text", ""))
 
 
-# =========================
-# GLOBAL RUNTIME STATE
-# =========================
+# ---------- Runtime ----------
 runtime = {
-    "sent_ids": [],          # [(message_id, number_or_none)]
-    "cycle_target": None,    # target period whose messages are currently shown
-    "confirmed_period": None,
-    "confirmed_result": None,
-    "confirmed_at": None,
+    "sent_ids": [],
+    "cycle_target": None,
     "phase": "idle",
     "api_ok": False,
     "api_error": "",
     "last_period": None,
     "last_result": None,
+    "confirmed_period": None,
+    "confirmed_result": None,
+    "confirmed_at": None,
+    "api_http": None,
 }
 
+capture_tasks = {}
 worker_task = None
 health_runner = None
-capture_tasks = {}
 
 
-# =========================
-# PERIOD / API PARSING
-# =========================
-def normalize_period(value):
-    if value is None:
+def normalize_period(v):
+    if v is None:
         return None
-    s = str(value).strip()
-    if not s:
-        return None
-    return s
+    s = str(v).strip()
+    return s or None
 
 
-def next_period(period: str):
-    s = normalize_period(period)
-    if not s:
+def next_period(p):
+    p = normalize_period(p)
+    if not p:
         return None
     try:
-        return str(int(s) + 1).zfill(len(s))
+        return str(int(p) + 1).zfill(len(p))
     except Exception:
-        # Fallback for non-numeric period strings:
-        return s
+        return p
 
 
-def rows_from_json(x: Any):
-    """
-    Recursively finds likely list containers in the API response.
-    Supports:
-      data.list
-      data.records
-      data.result
-      list
-      records
-      result
-      nested dictionaries/lists
-    """
-    if isinstance(x, list):
-        return x
+# ---------- API parser ----------
+def find_rows(payload: Any):
+    # This API is normally: {"data": {"list": [{"issueNumber":..., "number":...}]}}
+    if isinstance(payload, dict):
+        data = payload.get("data")
+        if isinstance(data, dict):
+            lst = data.get("list")
+            if isinstance(lst, list):
+                return lst
+        if isinstance(data, list):
+            return data
+        for key in ("list", "records", "result", "rows", "items", "history", "resultList"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return value
+    if isinstance(payload, list):
+        return payload
 
-    if isinstance(x, dict):
-        preferred = (
-            "list", "records", "data", "result",
-            "rows", "items", "history", "resultList"
-        )
-
-        for key in preferred:
-            if key in x:
-                v = x[key]
-                if isinstance(v, list):
-                    return v
-                found = rows_from_json(v)
-                if found:
-                    return found
-
-        for v in x.values():
-            found = rows_from_json(v)
-            if found:
-                return found
-
-    return []
+    # Deep fallback for changed API wrappers.
+    def walk(x):
+        if isinstance(x, list):
+            if any(isinstance(v, dict) for v in x):
+                return x
+            for v in x:
+                got = walk(v)
+                if got:
+                    return got
+        elif isinstance(x, dict):
+            for v in x.values():
+                got = walk(v)
+                if got:
+                    return got
+        return []
+    return walk(payload)
 
 
-def period_of(row):
+def get_field(row, names):
     if not isinstance(row, dict):
         return None
-
-    keys = (
-        "issueNumber", "issue", "period", "periodNumber",
-        "issueNo", "periodNo", "drawNumber", "drawNo"
-    )
-    for k in keys:
-        if row.get(k) is not None:
-            return normalize_period(row[k])
-
-    # Case-insensitive fallback.
-    for k, v in row.items():
-        lk = str(k).lower()
-        if any(
-            token in lk
-            for token in ("issuenumber", "periodnumber", "periodno", "drawnumber")
-        ):
-            p = normalize_period(v)
-            if p:
-                return p
-
+    for name in names:
+        if name in row and row[name] is not None:
+            return row[name]
+    lower = {str(k).lower(): v for k, v in row.items()}
+    for name in names:
+        if name.lower() in lower and lower[name.lower()] is not None:
+            return lower[name.lower()]
     return None
 
 
-def result_of(row):
-    if not isinstance(row, dict):
+def parse_result_value(v):
+    if v is None:
+        return None
+    s = str(v).strip()
+    # number can sometimes arrive as "7,green" or "7|..."
+    for sep in (",", "|", " "):
+        if sep in s:
+            s = s.split(sep, 1)[0].strip()
+    try:
+        n = int(s)
+        return n if 0 <= n <= 9 else None
+    except Exception:
         return None
 
-    keys = (
-        "number", "result", "openNumber", "winNumber",
-        "winningNumber", "open_num", "win_num"
-    )
 
-    for k in keys:
-        if row.get(k) is not None:
-            try:
-                value = str(row[k]).strip()
-                # Some APIs may return "7,..." or "7".
-                value = value.split(",")[0].strip()
-                n = int(value)
-                if 0 <= n <= 9:
-                    return n
-            except Exception:
-                pass
-
-    # Case-insensitive fallback.
-    for k, v in row.items():
-        lk = str(k).lower()
-        if any(token in lk for token in ("number", "result", "winnumber", "opennumber")):
-            try:
-                n = int(str(v).strip().split(",")[0])
-                if 0 <= n <= 9:
-                    return n
-            except Exception:
-                pass
-
-    return None
-
-
-def find_period_result(payload):
-    rows = rows_from_json(payload)
-
-    # First pass: normal rows.
+def parse_latest(payload):
+    rows = find_rows(payload)
+    # Prefer first API row. The endpoint returns newest first.
     for row in rows:
-        if isinstance(row, dict):
-            p = period_of(row)
-            n = result_of(row)
-            if p and n is not None:
-                return p, n
+        if not isinstance(row, dict):
+            continue
+        p = get_field(row, ["issueNumber", "issue", "period", "periodNumber", "issueNo"])
+        n = get_field(row, ["number", "result", "openNumber", "winNumber", "winningNumber"])
+        p = normalize_period(p)
+        n = parse_result_value(n)
+        if p and n is not None:
+            return p, n
 
-    # Deep fallback: search every dict in the payload.
+    # Deep search as final fallback.
     def walk(x):
         if isinstance(x, dict):
-            p = period_of(x)
-            n = result_of(x)
+            p = normalize_period(get_field(x, ["issueNumber", "issue", "period", "periodNumber", "issueNo"]))
+            n = parse_result_value(get_field(x, ["number", "result", "openNumber", "winNumber", "winningNumber"]))
             if p and n is not None:
                 return p, n
             for v in x.values():
@@ -325,227 +243,192 @@ def find_period_result(payload):
                 if got:
                     return got
         return None
-
     return walk(payload) or (None, None)
 
 
-async def fetch_latest(session):
-    url = DATA["api_url"].strip()
+async def _decode_api_bytes(raw: bytes):
+    """Decode the API even when it advertises application/octet-stream."""
+    if not raw:
+        raise ValueError("API returned an empty body")
 
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Linux; Android 10) "
-            "AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36"
-        ),
+    # Normal UTF-8 JSON (including UTF-8 BOM).
+    text = raw.decode("utf-8-sig", errors="replace").strip()
+
+    # Some gateways return JSON as a quoted JSON string, so allow a second decode.
+    candidates = [text]
+    if text.startswith('"') and text.endswith('"'):
+        try:
+            inner = json.loads(text)
+            if isinstance(inner, str):
+                candidates.append(inner)
+        except Exception:
+            pass
+
+    for candidate in candidates:
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            # Extract a JSON object/array if a gateway prepended/appended text.
+            starts = [candidate.find("{"), candidate.find("[")]
+            starts = [x for x in starts if x >= 0]
+            if not starts:
+                continue
+            start = min(starts)
+            end_obj = candidate.rfind("}")
+            end_arr = candidate.rfind("]")
+            end = max(end_obj, end_arr)
+            if end > start:
+                try:
+                    return json.loads(candidate[start:end + 1])
+                except json.JSONDecodeError:
+                    pass
+    raise ValueError(f"Invalid JSON body: {text[:500]}")
+
+
+def _requests_headers():
+    return {
+        "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36",
         "Accept": "application/json, text/plain, */*",
         "Referer": "https://draw.ar-lottery01.com/",
-        "Origin": "https://draw.ar-lottery01.com",
-        "Connection": "keep-alive",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
     }
 
-    log.info("API request: %s", url)
 
+async def _fetch_with_urllib(url):
+    """Fallback HTTP client. It is deliberately independent of aiohttp parsing."""
+    from urllib.request import Request, urlopen
+
+    def do_request():
+        req = Request(url, headers=_requests_headers(), method="GET")
+        with urlopen(req, timeout=REQUEST_TIMEOUT) as r:
+            return int(getattr(r, "status", 200)), dict(r.headers.items()), r.read()
+
+    return await asyncio.to_thread(do_request)
+
+
+async def fetch_latest(session):
+    base = DATA.get("api_url", API_URL_DEFAULT).strip() or API_URL_DEFAULT
+    sep = "&" if "?" in base else "?"
+    url = f"{base}{sep}t={int(time.time() * 1000)}"
+    headers = _requests_headers()
+
+    log.info("API GET: %s", url)
+
+    # Primary: aiohttp. We read raw bytes and decode ourselves because this endpoint
+    # is known to return JSON while advertising application/octet-stream.
     try:
-        # Cache-buster is useful on Render/proxies so the newest settled
-        # period is requested every poll.
-        request_url = url + ("&" if "?" in url else "?") + "_t=" + str(int(time.time() * 1000))
-
         async with session.get(
-            request_url,
+            url,
             headers=headers,
             timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
             allow_redirects=True,
-        ) as response:
-            status = response.status
-            content_type = response.headers.get("Content-Type", "")
+        ) as resp:
+            runtime["api_http"] = resp.status
+            raw = await resp.read()
+            ctype = resp.headers.get("Content-Type", "")
+            cenc = resp.headers.get("Content-Encoding", "")
+            log.info("API HTTP %s | content-type=%s | encoding=%s | bytes=%d", resp.status, ctype, cenc, len(raw))
+            if resp.status >= 400:
+                raise RuntimeError(f"HTTP {resp.status}")
+            payload = await _decode_api_bytes(raw)
+            period, result = parse_latest(payload)
+            if period and result is not None:
+                runtime.update({"api_ok": True, "api_error": "", "last_period": period, "last_result": result})
+                log.info("API LATEST -> period=%s result=%s", period, result)
+                return period, result
+            raise ValueError("JSON received but data.list[0].issueNumber/number not found")
+    except Exception as first_error:
+        log.warning("AIOHTTP API attempt failed: %s", first_error)
 
-            body = await response.text(errors="replace")
-
-            log.info(
-                "API response: HTTP %s | content-type=%s | bytes=%s",
-                status,
-                content_type,
-                len(body.encode("utf-8")),
-            )
-
-            response.raise_for_status()
-
-            try:
-                payload = json.loads(body)
-            except Exception:
-                log.error("API did not return valid JSON. First 500 chars: %s", body[:500])
-                raise
-
-            period, result = find_period_result(payload)
-
-            if period is None or result is None:
-                log.error(
-                    "API JSON received but period/result not detected. "
-                    "Top-level type=%s | keys=%s",
-                    type(payload).__name__,
-                    list(payload.keys())[:30] if isinstance(payload, dict) else "n/a",
-                )
-                log.error("API sample: %s", body[:1000])
-                return None, None
-
-            log.info("API latest: period=%s result=%s", period, result)
-            runtime["api_ok"] = True
-            runtime["api_error"] = ""
-            runtime["last_period"] = period
-            runtime["last_result"] = result
+    # Fallback: urllib. This handles unusual proxy/content-type behavior independently.
+    try:
+        status, hdrs, raw = await _fetch_with_urllib(url)
+        runtime["api_http"] = status
+        log.info("API FALLBACK HTTP %s | content-type=%s | bytes=%d", status, hdrs.get("Content-Type", ""), len(raw))
+        if status >= 400:
+            raise RuntimeError(f"HTTP {status}")
+        payload = await _decode_api_bytes(raw)
+        period, result = parse_latest(payload)
+        if period and result is not None:
+            runtime.update({"api_ok": True, "api_error": "", "last_period": period, "last_result": result})
+            log.info("API FALLBACK LATEST -> period=%s result=%s", period, result)
             return period, result
-
-    except Exception as e:
+        raise ValueError("Fallback JSON received but data.list[0].issueNumber/number not found")
+    except Exception as second_error:
         runtime["api_ok"] = False
-        runtime["api_error"] = f"{type(e).__name__}: {e}"
-        log.exception("API fetch failed: %s", e)
+        runtime["api_error"] = f"AIOHTTP: {type(first_error).__name__}: {first_error} | FALLBACK: {type(second_error).__name__}: {second_error}"
+        log.error("API ERROR -> %s", runtime["api_error"])
         return None, None
 
 
-# =========================
-# TELEGRAM SEND / DELETE
-# =========================
-async def send_record(app, chat_id, record, period3=None):
+# ---------- Telegram output ----------
+async def send_record(app, record, period3=None):
     text = record_text(record)
-
     if not text:
         return None
-
-    # Header placeholder replacement without changing user message entities
-    # is safest only when placeholder is outside entities. For the default
-    # header this is true. If replacement changes offsets, send plain text.
+    entities = record_to_entities(record)
     if period3 is not None and "{period3}" in text:
         text = text.replace("{period3}", str(period3))
-        entities = record_to_entities(record)
-        if entities:
-            # Offsets can become invalid after replacement; use HTML/text fallback.
-            entities = []
-    else:
-        entities = record_to_entities(record)
-
+        # Replacement changes offsets; safest fallback is plain text for header.
+        entities = []
     try:
         return await app.bot.send_message(
-            chat_id=chat_id,
+            chat_id=TARGET_CHAT_ID,
             text=text,
             entities=entities or None,
             disable_web_page_preview=True,
         )
     except Exception as e:
-        log.error("Telegram send failed: %s", e)
-
-        # Last-resort plain-text send. This prevents one malformed entity
-        # from stopping the whole cycle.
+        log.warning("Formatted send failed: %s", e)
         try:
-            return await app.bot.send_message(
-                chat_id=chat_id,
-                text=text,
-                disable_web_page_preview=True,
-            )
-        except Exception:
-            log.exception("Telegram plain-text fallback also failed")
+            return await app.bot.send_message(chat_id=TARGET_CHAT_ID, text=text, disable_web_page_preview=True)
+        except Exception as e2:
+            log.error("Plain send failed: %s", e2)
             return None
 
 
 async def delete_tracked(app, keep_numbers=None):
-    keep_numbers = set(keep_numbers or [])
+    keep = set(keep_numbers or [])
     remaining = []
-
     for item in list(runtime["sent_ids"]):
-        if isinstance(item, dict):
-            mid = item.get("id")
-            number = item.get("number")
-        else:
-            mid = item[0] if item else None
-            number = item[1] if len(item) > 1 else None
-
-        if mid is None:
+        mid = item.get("id")
+        num = item.get("number")
+        if num in keep:
+            remaining.append(item)
             continue
-
-        if number in keep_numbers:
-            remaining.append({"id": mid, "number": number})
-            continue
-
         try:
-            await app.bot.delete_message(
-                chat_id=TARGET_CHAT_ID,
-                message_id=int(mid),
-            )
+            await app.bot.delete_message(TARGET_CHAT_ID, int(mid))
         except Exception as e:
-            # Already deleted / too old / not found is harmless.
-            log.warning("Delete message %s failed: %s", mid, e)
-
+            log.debug("Delete %s skipped: %s", mid, e)
     runtime["sent_ids"] = remaining
 
 
-async def send_cycle(app, target_period):
-    # Remove anything still visible from the previous cycle.
-    await delete_tracked(app, keep_numbers=set())
-
-    p3 = str(target_period)[-3:].zfill(3)
-
-    header_msg = await send_record(
-        app,
-        TARGET_CHAT_ID,
-        DATA["header"],
-        period3=p3,
-    )
-    if header_msg:
-        runtime["sent_ids"].append({
-            "id": header_msg.message_id,
-            "number": None,
-        })
-
-    sent_count = 0
-
+async def send_cycle(app, target):
+    await delete_tracked(app)
+    p3 = str(target)[-3:].zfill(3)
+    h = await send_record(app, DATA["header"], p3)
+    if h:
+        runtime["sent_ids"].append({"id": h.message_id, "number": None})
+    count = 0
     for n in range(10):
-        record = DATA["messages"].get(str(n), {})
-        if not record_text(record):
+        rec = DATA["messages"].get(str(n), {})
+        if not record_text(rec):
             continue
-
-        msg = await send_record(app, TARGET_CHAT_ID, record)
+        msg = await send_record(app, rec)
         if msg:
-            runtime["sent_ids"].append({
-                "id": msg.message_id,
-                "number": n,
-            })
-            sent_count += 1
-
-    runtime["cycle_target"] = str(target_period)
+            runtime["sent_ids"].append({"id": msg.message_id, "number": n})
+            count += 1
+    runtime["cycle_target"] = str(target)
     runtime["phase"] = "waiting_result"
-
-    log.info(
-        "Cycle sent: target_period=%s | messages=%s",
-        target_period,
-        sent_count,
-    )
+    log.info("CYCLE SENT -> target=%s configured_messages=%d", target, count)
 
 
-async def keep_only_result(app, result_number):
-    # Keep only the configured message for the winning number.
-    await delete_tracked(app, keep_numbers={int(result_number)})
-
-
-# =========================
-# MAIN CYCLE WORKER
-# =========================
 async def cycle_worker(app):
-    log.info("Cycle worker started")
-
+    log.info("CYCLE WORKER STARTED")
     timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
-    connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300)
-
-    async with aiohttp.ClientSession(
-        timeout=timeout,
-        connector=connector,
-    ) as session:
-
-        # A fresh state after deploy/restart.
-        runtime["cycle_target"] = None
-        runtime["phase"] = "idle"
-        runtime["confirmed_period"] = None
-        runtime["confirmed_result"] = None
-        runtime["confirmed_at"] = None
-
+    connector = aiohttp.TCPConnector(limit=5, ttl_dns_cache=60, enable_cleanup_closed=True)
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         while True:
             try:
                 if not DATA.get("running"):
@@ -554,393 +437,210 @@ async def cycle_worker(app):
                     continue
 
                 period, result = await fetch_latest(session)
-
                 if not period:
+                    runtime["phase"] = "api_error"
                     await asyncio.sleep(POLL_SECONDS)
                     continue
 
                 now = time.monotonic()
 
-                # -------------------------
-                # FIRST START
-                # -------------------------
                 if runtime["cycle_target"] is None:
                     target = next_period(period)
-                    if target is None:
-                        await asyncio.sleep(POLL_SECONDS)
-                        continue
-
-                    log.info(
-                        "Starting first cycle: API latest=%s result=%s -> target=%s",
-                        period, result, target
-                    )
-                    await send_cycle(app, target)
+                    log.info("FIRST CYCLE -> latest=%s result=%s target=%s", period, result, target)
+                    if target:
+                        await send_cycle(app, target)
                     await asyncio.sleep(POLL_SECONDS)
                     continue
 
                 target = str(runtime["cycle_target"])
 
-                # -------------------------
-                # RESULT CONFIRMATION
-                # -------------------------
                 if runtime["phase"] == "waiting_result":
-                    if str(period) == target and result is not None:
-                        log.info(
-                            "Target period completed: %s | result=%s",
-                            target,
-                            result,
-                        )
-
-                        await keep_only_result(app, result)
-
+                    if str(period) == target:
+                        log.info("RESULT CONFIRMED -> period=%s result=%s", target, result)
+                        await delete_tracked(app, {int(result)})
                         runtime["confirmed_period"] = target
                         runtime["confirmed_result"] = result
                         runtime["confirmed_at"] = now
                         runtime["phase"] = "waiting_90_seconds"
 
-                        log.info(
-                            "Keeping result %s for period %s; next cycle in %ss",
-                            result,
-                            target,
-                            NEXT_SEND_DELAY,
-                        )
-
-                # -------------------------
-                # 90-SECOND DELAY
-                # -------------------------
                 elif runtime["phase"] == "waiting_90_seconds":
-                    confirmed_at = runtime.get("confirmed_at")
-
-                    if (
-                        confirmed_at is not None
-                        and now - float(confirmed_at) >= NEXT_SEND_DELAY
-                    ):
+                    at = runtime.get("confirmed_at")
+                    if at is not None and now - float(at) >= NEXT_SEND_DELAY:
                         new_target = next_period(target)
-
-                        if new_target is None:
-                            log.error("Could not calculate next period from %s", target)
-                        else:
-                            log.info(
-                                "90 seconds complete: %s -> next target=%s",
-                                target,
-                                new_target,
-                            )
-                            await send_cycle(app, new_target)
+                        log.info("90 SEC COMPLETE -> target=%s next=%s", target, new_target)
+                        await send_cycle(app, new_target)
 
                 await asyncio.sleep(POLL_SECONDS)
-
             except asyncio.CancelledError:
-                log.info("Cycle worker cancelled")
                 raise
             except Exception:
-                log.exception("Cycle worker error")
+                log.exception("WORKER ERROR")
                 await asyncio.sleep(POLL_SECONDS)
 
 
-# =========================
-# COMMANDS
-# =========================
-def is_admin(update: Update):
-    user = update.effective_user
-    return bool(user and user.id == ADMIN_ID)
+# ---------- Commands ----------
+def is_admin(update):
+    return bool(update.effective_user and update.effective_user.id == ADMIN_ID)
 
+async def deny(update):
+    await update.effective_message.reply_text("❌ Admin only.")
 
-async def deny(update: Update):
-    if update.effective_message:
-        await update.effective_message.reply_text("❌ Admin only.")
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return await deny(update)
-
+async def start(update, context):
+    if not is_admin(update): return await deny(update)
     await update.effective_message.reply_text(
-        "✅ Bot 1 ready.\n\n"
-        "/go - start\n"
-        "/stop - stop\n"
-        "/status - status\n"
-        "/setmessage 0 - then send the message\n"
-        "/setheader - then send header\n"
-        "/updateapi <URL>\n"
-        "/changename <name>\n"
-        "/clearchat"
+        "✅ Bot 1 ready.\n\n/go - start\n/stop - stop\n/status - status\n"
+        "/setmessage 0 - then send the message\n/setheader - then send header\n"
+        "/updateapi <URL>\n/changename <name>\n/clearchat"
     )
 
-
-async def go(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return await deny(update)
-
+async def go(update, context):
+    if not is_admin(update): return await deny(update)
     DATA["running"] = True
     save_data()
-
-    runtime["phase"] = "idle"
     runtime["cycle_target"] = None
+    runtime["phase"] = "idle"
     runtime["confirmed_at"] = None
-
     await update.effective_message.reply_text("▶️ Bot 1 started.")
 
-
-async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return await deny(update)
-
+async def stop(update, context):
+    if not is_admin(update): return await deny(update)
     DATA["running"] = False
     save_data()
     runtime["phase"] = "stopped"
-
     await update.effective_message.reply_text("⏹ Bot 1 stopped.")
 
-
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return await deny(update)
-
-    api_state = "🟢 OK" if runtime["api_ok"] else "🔴 WAIT/ERROR"
-
+async def status(update, context):
+    if not is_admin(update): return await deny(update)
+    err = runtime.get("api_error") or "-"
+    if len(err) > 500: err = err[:500]
     await update.effective_message.reply_text(
         f"Status: {'🟢 RUNNING' if DATA.get('running') else '🔴 STOPPED'}\n"
         f"API: {DATA['api_url']}\n"
-        f"API state: {api_state}\n"
+        f"API state: {'🟢 OK' if runtime['api_ok'] else '🔴 WAIT/ERROR'}\n"
+        f"HTTP: {runtime.get('api_http') or '-'}\n"
         f"Latest period: {runtime.get('last_period') or '-'}\n"
         f"Latest result: {runtime.get('last_result') if runtime.get('last_result') is not None else '-'}\n"
         f"Cycle target: {runtime.get('cycle_target') or '-'}\n"
-        f"Phase: {runtime.get('phase') or '-'}"
+        f"Phase: {runtime.get('phase') or '-'}\n"
+        f"Error: {err}"
     )
 
-
-async def changename(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return await deny(update)
-
+async def changename(update, context):
+    if not is_admin(update): return await deny(update)
     name = " ".join(context.args).strip()
-    if not name:
-        return await update.effective_message.reply_text(
-            "Use: /changename Your Bot Name"
-        )
-
+    if not name: return await update.effective_message.reply_text("Use: /changename Your Bot Name")
     try:
         await context.bot.set_my_name(name=name)
-        await update.effective_message.reply_text(
-            f"✅ Bot name changed to: {name}"
-        )
+        await update.effective_message.reply_text(f"✅ Bot name changed to: {name}")
     except Exception as e:
-        await update.effective_message.reply_text(
-            f"❌ Could not change name: {e}"
-        )
+        await update.effective_message.reply_text(f"❌ {e}")
 
-
-async def updateapi(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return await deny(update)
-
+async def updateapi(update, context):
+    if not is_admin(update): return await deny(update)
     url = " ".join(context.args).strip()
-    if not url:
-        return await update.effective_message.reply_text(
-            "Use: /updateapi <URL>"
-        )
-
+    if not url: return await update.effective_message.reply_text("Use: /updateapi <URL>")
     DATA["api_url"] = url
     save_data()
     runtime["api_ok"] = False
     runtime["api_error"] = ""
+    await update.effective_message.reply_text(f"✅ API updated.\n{url}")
 
-    await update.effective_message.reply_text(
-        f"✅ API updated.\n{url}"
-    )
-
-
-async def setmessage(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return await deny(update)
-
-    if not context.args:
-        return await update.effective_message.reply_text(
-            "Use: /setmessage 0"
-        )
-
+async def setmessage(update, context):
+    if not is_admin(update): return await deny(update)
+    if not context.args: return await update.effective_message.reply_text("Use: /setmessage 0")
     try:
         n = int(context.args[0])
-        if n < 0 or n > 9:
-            raise ValueError
+        if not 0 <= n <= 9: raise ValueError
     except Exception:
-        return await update.effective_message.reply_text(
-            "❌ Number must be 0 to 9."
-        )
+        return await update.effective_message.reply_text("❌ Number must be 0 to 9.")
+    capture_tasks[update.effective_user.id] = {"kind": "message", "number": n}
+    await update.effective_message.reply_text(f"✏️ Send the message for number {n}.")
 
-    capture_tasks[update.effective_user.id] = {
-        "kind": "message",
-        "number": n,
-    }
+async def setheader(update, context):
+    if not is_admin(update): return await deny(update)
+    capture_tasks[update.effective_user.id] = {"kind": "header"}
+    await update.effective_message.reply_text("✏️ Send the header. Use {period3} for last 3 digits.")
 
-    await update.effective_message.reply_text(
-        f"✏️ Send the message for number {n}."
-    )
-
-
-async def setheader(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return await deny(update)
-
-    capture_tasks[update.effective_user.id] = {
-        "kind": "header",
-    }
-
-    await update.effective_message.reply_text(
-        "✏️ Send the header.\n"
-        "Use {period3} where you want the last 3 digits of the period."
-    )
-
-
-async def clearchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return await deny(update)
-
+async def clearchat(update, context):
+    if not is_admin(update): return await deny(update)
     count = 0
-
     for item in list(runtime["sent_ids"]):
-        mid = item.get("id") if isinstance(item, dict) else item[0]
         try:
-            await context.bot.delete_message(
-                chat_id=TARGET_CHAT_ID,
-                message_id=int(mid),
-            )
+            await context.bot.delete_message(TARGET_CHAT_ID, int(item["id"]))
             count += 1
         except Exception:
             pass
-
     runtime["sent_ids"] = []
+    await update.effective_message.reply_text(f"🧹 Cleared {count} tracked bot messages.")
 
-    await update.effective_message.reply_text(
-        f"🧹 Cleared {count} tracked bot messages."
-    )
-
-
-async def capture_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return
-
-    user = update.effective_user
-    if not user:
-        return
-
-    task = capture_tasks.get(user.id)
-    if not task:
-        return
-
-    message = update.effective_message
-    if not message:
-        return
-
-    if not (message.text or message.caption):
-        await message.reply_text("❌ Please send text/message content.")
-        return
-
-    record = message_to_record(message)
-
+async def capture_message(update, context):
+    if not is_admin(update): return
+    uid = update.effective_user.id
+    task = capture_tasks.get(uid)
+    if not task: return
+    msg = update.effective_message
+    if not msg or not (msg.text or msg.caption):
+        return await msg.reply_text("❌ Please send text/message content.")
+    rec = message_to_record(msg)
     if task["kind"] == "message":
-        n = int(task["number"])
-        DATA["messages"][str(n)] = record
-        save_data()
-        del capture_tasks[user.id]
-
-        await message.reply_text(f"✅ Message for {n} saved.")
-        return
-
-    if task["kind"] == "header":
-        DATA["header"] = record
-        save_data()
-        del capture_tasks[user.id]
-
-        await message.reply_text("✅ Header saved.")
+        DATA["messages"][str(task["number"])] = rec
+        save_data(); del capture_tasks[uid]
+        return await msg.reply_text(f"✅ Message for {task['number']} saved.")
+    DATA["header"] = rec
+    save_data(); del capture_tasks[uid]
+    await msg.reply_text("✅ Header saved.")
 
 
-# =========================
-# RENDER HEALTH SERVER
-# =========================
+# ---------- Render Web Service ----------
+async def index(request):
+    return web.Response(text="Bot 1 is running.", content_type="text/plain")
+
 async def health(request):
     return web.json_response({
         "ok": True,
         "running": bool(DATA.get("running")),
         "phase": runtime.get("phase"),
+        "api_ok": runtime.get("api_ok"),
+        "http": runtime.get("api_http"),
         "period": runtime.get("last_period"),
         "result": runtime.get("last_result"),
+        "error": runtime.get("api_error", ""),
     })
 
-
-async def index(request):
-    return web.Response(
-        text="Bot 1 is running.",
-        content_type="text/plain",
-    )
-
-
-async def start_health_server():
+async def start_health():
+    global health_runner
     app = web.Application()
     app.router.add_get("/", index)
     app.router.add_get("/health", health)
-
-    runner = web.AppRunner(app)
-    await runner.setup()
-
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    health_runner = web.AppRunner(app)
+    await health_runner.setup()
+    site = web.TCPSite(health_runner, "0.0.0.0", PORT)
     await site.start()
-
-    log.info("Health server listening on 0.0.0.0:%s", PORT)
-    return runner
+    log.info("WEB SERVICE HEALTH LISTENING -> 0.0.0.0:%s", PORT)
 
 
-# =========================
-# APP STARTUP
-# =========================
 async def post_init(application: Application):
-    global worker_task, health_runner
-
-    # IMPORTANT: health server + Telegram + cycle worker all run on the
-    # SAME asyncio event loop used by python-telegram-bot.
-    health_runner = await start_health_server()
-    log.info("Render health server started on port %s", PORT)
-
-    # Use PTB's managed task system so the worker definitely runs on the
-    # same event loop as Telegram polling and is tracked by the Application.
-    worker_task = application.create_task(
-        cycle_worker(application),
-        name="bot1-cycle-worker",
-    )
-    log.info("Cycle worker task created and scheduled by Application.")
-
+    global worker_task
+    await start_health()
+    worker_task = application.create_task(cycle_worker(application), name="bot1-cycle-worker")
+    log.info("API/CYCLE WORKER SCHEDULED")
 
 async def post_shutdown(application: Application):
     global worker_task, health_runner
-
     if worker_task:
         worker_task.cancel()
-        try:
-            await worker_task
-        except asyncio.CancelledError:
-            pass
+        try: await worker_task
+        except asyncio.CancelledError: pass
         worker_task = None
-
     if health_runner:
-        try:
-            await health_runner.cleanup()
-        except Exception:
-            log.exception("Health server cleanup failed")
+        await health_runner.cleanup()
         health_runner = None
 
 
 def build_application():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN environment variable is missing.")
-
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .post_init(post_init)
-        .post_shutdown(post_shutdown)
-        .build()
-    )
-
+    app = (Application.builder().token(BOT_TOKEN).post_init(post_init).post_shutdown(post_shutdown).build())
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("go", go))
     app.add_handler(CommandHandler("stop", stop))
@@ -950,27 +650,14 @@ def build_application():
     app.add_handler(CommandHandler("setheader", setheader))
     app.add_handler(CommandHandler("updateapi", updateapi))
     app.add_handler(CommandHandler("clearchat", clearchat))
-
-    # Text/caption capture is deliberately after commands.
-    app.add_handler(
-        MessageHandler(
-            (filters.TEXT | filters.Caption()) & ~filters.COMMAND,
-            capture_message,
-        )
-    )
-
+    app.add_handler(MessageHandler((filters.TEXT | filters.Caption()) & ~filters.COMMAND, capture_message))
     return app
 
 
 def main():
     app = build_application()
-    log.info("Starting Telegram polling + API worker...")
-    app.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=False,
-        close_loop=True,
-    )
-
+    log.info("STARTING BOT 1 WEB SERVICE")
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False, close_loop=True)
 
 if __name__ == "__main__":
     main()
