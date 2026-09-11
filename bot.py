@@ -22,7 +22,8 @@ REQUEST_TIMEOUT = 5
 # Only used when the origin returns HTTP 403/blocked to Render.
 # The origin URL itself remains the primary source.
 API_PROXY_URLS = [
-    "https://api.codetabs.com/v1/proxy?quest=",
+    "https://corsproxy.io/?url=",
+    "https://r.jina.ai/",
     "https://api.allorigins.win/raw?url=",
 ]
 PORT = int(os.getenv("PORT", "10000"))
